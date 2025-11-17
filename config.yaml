@@ -1,0 +1,314 @@
+# Конфигурационный файл для системы подготовки датасета логов
+# Все параметры подключения, токены, пути и настройки
+
+# Настройки подключения к внешним сервисам
+api:
+  # Настройки для работы с LLM моделями
+  openai:
+    api_key: "your-openai-api-key"
+    base_url: "https://api.openai.com/v1"
+    model: "gpt-4"
+    max_tokens: 4000
+    temperature: 0.7
+  
+  # Настройки для других провайдеров (если нужны)
+  anthropic:
+    api_key: "your-anthropic-api-key"
+    model: "claude-3-sonnet"
+  
+  huggingface:
+    api_token: "your-hf-token"
+    model: "microsoft/DialoGPT-medium"
+
+# Настройки датасета
+dataset:
+  # Пути к файлам и папкам
+  original: "./dataset/original"
+  cleaned: "./dataset/cleaned"
+  prepared: "./dataset/prepared"
+  logs_dir: "./logs"
+  dataset: "./dataset/train"
+  drain: "./dataset/drain"
+  drain_chunks: "./dataset/drain/drain_chunks.jsonl"
+  drain_list:
+    - "./dataset/drain/test.jsonl"
+    - "./dataset/drain/train.jsonl"
+    - "./dataset/drain/val.jsonl"
+  vocab_list:
+    - "./dataset/drain/train.jsonl"
+  vocab: "./dataset/vocab"
+  restore_dir: "./dataset/restore"
+
+  # Настройки очистки логов с помощью общих паттернов
+  clean_patterns:
+    tfs_timestamp: ## время tfs в начале строки
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s'
+      replace: ""
+
+    tfs_lines: ## tfs строчки к удалению
+      pattern: '^(Description|Version|Author|Help)\s*:\s*.*$'
+      replace: ""
+    tfs_comments: ## tfs комментарии к удалению
+      pattern: '^={26}\s.*$'
+      replace: ""
+
+    tfs_section_stub: ## служебная разметка скриптами загрузки логов
+      pattern: '^======= ##\[section\]Starting:.*$'
+      replace: ""
+    tfs_sections_finishing: ## концовка tfs секции - удаляем
+      pattern: '^##\[section\]Finishing:.*$'
+      replace: ""
+
+    log_timestamp: ## время в начале строки лога
+      pattern: '^\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}:\d{2}\s'
+      replace: ""
+
+    tfs_lines_tail: ## завершение строки tfs
+      pattern: '\s={26}$'
+      replace: ""
+    empty_lines: ## пустые строки
+      pattern: '^$'
+      replace: ""
+    stub_lines:
+      pattern: '^\s*$' ## строки заглушки из пробелов
+      replace: ""
+    star_lines:
+      pattern: '^\**$' ## строки заглушки из звездочек
+      replace: ""
+    equal_lines:
+      pattern: '^=*$' ## строки заглушки из равенств
+      replace: ""
+    comment_lines:
+      pattern: '^(#|##)\s.*$' ## строки комментариев '^(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))+$'
+      replace: ""
+
+    ansi_commands:
+      pattern: '\x1b\[[0-9;]*m' ## ANSI команды
+      replace: ""
+    comment_in_source: ## комментарии в исходном коде
+      pattern: '^\s*#{12,}.*$'
+      replace: ""
+
+  # Настройки обработки логов, включая восстановление строк из prepared файлов
+  # pattern - это регулярное выражение для поиска в prepared файле
+  # replace - это строка, которую нужно заменить на pattern
+  # recovery - это регулярное выражение для поиска в cleaned файле
+  filter_patterns:
+    tfs_decorator: ## декоратор tfs
+      pattern: '^\s*#{10,}\s*System Pipeline Decorator.*$'
+      replace: "<TFS_Decorator>"
+      recovery: '^\<TFS_Decorator\>$'
+    tfs_task_name: ## tfs имя задачи
+      pattern: '^Task\s{9,}:'
+      replace: "<TFS_Task>"
+      recovery: '^\<TFS_Task\>'
+
+    tfs_sections: ## начало tfs секции
+      pattern: '^##\[section\]Starting:'
+      replace: "<TFS_Section>"
+      recovery: '^\<TFS_Section\>'
+    tfs_sub_sections: ## начало именованной tfs секции
+      pattern: '^##\[section\]={26}\s'
+      replace: "<TFS_SubSection> "
+      recovery: '^\<TFS_SubSection\>\s'
+    tfs_command_sections: ## начало командной секции tfs
+      pattern: '^##\[command\]\s'
+      replace: "<TFS_Command> "
+      recovery: '^\<TFS_Command\>\s'
+    tfs_command_sections_2: ## начало командной секции tfs
+      pattern: '^##\[command\]"'
+      replace: "<TFS_Command> \""
+      recovery: '^\<TFS_Command\>\s\"'
+    tfs_command_script: ## начало скрипта в командной секции tfs
+      pattern: '^\[command\]'
+      replace: "<TFS_Script>"
+      recovery: '^\<TFS_Script\>'
+    tfs_section_start: ## начало асинхронной секции tfs
+      pattern: '^##\[section\]Async Command Start:'
+      replace: "<TFS_Section_Start>"
+      recovery: '^\<TFS_Section_Start\>'
+    tfs_section_end: ## конец асинхронной секции tfs
+      pattern: '^##\[section\]Async Command End:'
+      replace: "<TFS_Section_End>"
+      recovery: '^\<TFS_Section_End\>'
+
+    log_sha256: ## sha256
+      pattern: 'sha256:[0-9a-fA-F]{64}'
+      replace: "<SHA256>"
+      recovery: '\<SHA256\>'
+    log_porter: ## porter tag
+      pattern: 'porter-[0-9a-fA-F]{32}'
+      replace: "<PorterTag>"
+      recovery: '\<PorterTag\>'
+
+    log_uuid: ## uuid версии 4
+      pattern: '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+      replace: "<UUID>"
+      recovery: '\<UUID\>'
+    log_image_id_1: ## image id в начале строки
+      pattern: '[0-9a-fA-F]{12}:\s'
+      replace: "<ImageID> "
+      recovery: '\<ImageID\>\s'
+    log_image_id_2: ## image id
+      pattern: '\s[0-9a-fA-F]{12}\s'
+      replace: " <ImageID> "
+      recovery: '\s\<ImageID\>\s'
+    log_image_id_3: ## image id в конце строки
+      pattern: '\s[0-9a-fA-F]{12}$'
+      replace: " <ImageID>"
+      recovery: '\s\<ImageID\>'
+    log_iso8601: ## время в iso8601
+      pattern: '"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})"'
+      replace: "<ISO8601>"
+      recovery: '\<ISO8601\>'
+    log_file_properties_1: ## свойства файлов
+      pattern: '^\d+\s+(-|d)[-rwxst]{9}\s+\d+\s+\w+\s+\w+\s+\d+\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}\s'
+      replace: " <FileProperties> "
+      recovery: '\s\<FileProperties\>\s'
+    log_file_properties_2: ## свойства файлов
+      pattern: '^(-|d)[-rwxst]{9}\s+\d+\s+\w+\s+\w+\s+\d+\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}\s'
+      replace: " <FileProperties> "
+      recovery: '\s\<FileProperties\>\s'
+    log_file_datetime: ## время создания или изменения файлов
+      pattern: '\s(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}\s'
+      replace: " <DateTime> "
+      recovery: '\s\<DateTime\>\s'
+
+    log_web_url: ## ссылка на сетевой ресурс
+      pattern: '(\s?(?:https?|ftp)://[\w.-]+(?::\d{1,5})?(?:/[\w./-]*)/)([\w.-]+)\s?' # разделение на base url и path
+      replace: '<WebURL>/\2 '
+      recovery: '\<WebURL\>\/'
+    log_repo_url: ## ссылка на сетевой ресурс как репозиторий:тэг
+      pattern: '(\s?)(?:[\w.-]+(?::\d{1,5})?(?:/[\w./-]*)/)([\w.-]+)(\s?):' # разделение на base url и path
+      replace: '<RepoURL>/\2:'
+      recovery: '\<RepoURL\>\/'
+    log_repo_url_2: ## ссылка на сетевой ресурс как репозиторий@sha
+      pattern: '(\s?)(?:[\w.-]+(?::\d{1,5})?(?:/[\w./-]*)/)([\w.-]+)(\s?)@' # разделение на base url и path
+      replace: ' <RepoURL>/\2@'
+      recovery: '\s\<RepoURL\>\/.*@'
+    log_web_url_2: ## ссылка на сетевой ресурс
+      pattern: '\s(\s?)(?:[\w.-]+(?::\d{1,5})?(?:/[\w./-]*)/)([\w.-]+)(\s?)$' # разделение на base url и path
+      replace: ' <NetPath>/\2'
+      recovery: '\s\<NetPath\>\/'
+    log_web_url_3: ## ссылка на сетевой ресурс в начале строки
+      pattern: '^(\s?)(?:[\w.-]+(?::\d{1,5})?(?:/[\w./-]*)/)([\w.-]+)(\s?)\s' # разделение на base url и path
+      replace: '<NetPath>/\2 '
+      recovery: '^<NetPath\>\/'
+    log_path_1: ## ссылка на путь в начале строки
+      pattern: '^(?:/[^/]+)+/([^/]*)$' # разделение на path и filename
+      replace: '<Path>/\1'
+      recovery: '^\<Path\>\/'
+    log_path_2: ## ссылка на путь в начале строки после классификатора с колоном
+      #pattern: '^(\w+:)?\s*(?:/[^/]+)+/([^/]*)$' # разделение на path и filename
+      pattern: '^([^:\s]+:)?\s*(?:/[^/]+)+/([^/]+)/?$' # разделение на path и filename
+      replace: '\1 <Path>/\2 '
+      recovery: '^.*\s\<Path\>\/'
+    log_net_path: ## ссылка на сетевой ресурс
+      pattern: '(\s?)(\\{2}[\w.-]+\\{1}[\w.-]+(?:\\{1}[\w.-]+)*\\)([\w.-]+)(\s?)'
+      replace: '\1<UNC_BASE>\\\3\4'
+      recovery: '.*\<UNC_BASE\>\/.*'
+    log_sha256_2: ## sha256 в комментариях
+      pattern: '[0-9a-fA-F]{64}'
+      replace: "<Sha256>"
+      recovery: '\<Sha256\>'
+
+  encoding: "utf-8"
+  batch_size: 256 # для RTX 4080 оптимально 256
+  
+  remove_empty_lines: true # удалять пустые строки
+
+  # Параметры разбиения данных для LogBERT
+  train_split: 0.75          # Доля данных для обучения
+  val_split: 0.15            # Доля данных для валидации (test = 1 - train - val)
+  min_seq_len: 5             # Минимальная длина последовательности
+  max_chunk_len: 200         # Максимальная длина чанка
+  chunk_stride: 100          # 50% overlap
+  ## Почему 0.75? Так как train содержит все группы из val/test для гарантии присутствия, и
+  ## является обязательным исключение ситуации, когда в val/test есть уникальные группы, которые нет в train,
+  ## то при формировании групп в первую очередь попалняется train, а затем val/test. Так как иначе уникальные
+  ## группы в val/test будут работать как аномалии! А поскольку в наборе есть маленькие группы, то
+  ## train будет содержать больше чанков, чем указано в train_split. Что и происходит в реальности!
+  
+  # Настройки случайности
+  random_seed: 42             # Seed для воспроизводимости
+  
+  windows: ## настройки окна для LogBERT, Для RTX 4080 оптимально
+    size: 64
+    d_model: 512
+    max_len: 512
+    batch_size: 256
+
+  # Настройки разметки секций, используется для разметки секций в drain_dataset.py
+  section_markers:
+    use_azure_sections: true   # Использовать Azure DevOps секции (##[section]Starting:/Finishing:)
+    use_tfs_sections: true    # Использовать TFS секции (<TFS_Section>...)
+    tfs_regex: "<TFS_Section>\\s*(.+)"  # Регулярное выражение для поиска TFS секций
+  
+  # Настройки Drain3
+  drain3_config:
+    # Параметры для TemplateMiner
+    depth: 4
+    sim_threshold: 0.6 ## похожесть строк, можно увеличить до 0.7-0.8 для более точных результатов
+    max_children: 200
+    max_clusters: 100000 # расход памяти примерно 5-10kb на кластер
+    # Дополнительные параметры Drain3
+    extra_delimiters: []
+    param_str: "<*>"
+    ##param_regex: "[\\w\\-\\.]+"
+    param_regex: "[\\w\\-\\.:/\\\\]+"   # расширить, если много путей/URL
+    store_parameters: false  # не сохранять параметры и примеры сообщений, так как применяем drain_mapping.jsonl
+
+vocab:
+  min_support: 1 # минимальная частота события для включения в словарь
+  exclude_patterns:
+    - "<TFS_Section>"
+    - "##\\[debug\\]"
+    - "Environment"
+    - "Variable"
+
+# Настройки логгирования
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  console_output: true
+  file_output: true
+  json_output: true
+  
+# Настройки GPU
+gpu:
+  device: "cuda"
+  memory_fraction: 0.8
+  mixed_precision: true
+
+# Настройки модели LogBERT для обучения
+model:
+  checkpoints: "./model/checkpoints"
+  reports: "./dataset/reports"
+  quantized: "./model/quantized"
+  mlflow:
+    url: "http://localhost:5000"
+    experiment_name: "LogBERT_training"
+    enabled: false
+
+  # Архитектура модели
+  d_model: 512           # Размерность модели
+  n_heads: 8             # Количество голов внимания
+  n_layers: 6            # Количество слоев трансформера
+  dim_ff: 2048           # Размерность feed-forward слоя
+  dropout: 0.1           # Dropout вероятность
+  max_len: 512           # Максимальная длина последовательности
+  section_buckets: 2048  # Количество бакетов для секций
+  
+  # Параметры обучения
+  batch_size: 256        # Размер батча (для RTX 4080 оптимально 256)
+  lr: 0.0001             # Learning rate (1e-4)
+  weight_decay: 0.01     # Weight decay
+  grad_clip: 1.0         # Gradient clipping threshold
+  amp: true              # Использовать mixed precision training
+  seed: 42               # Seed для воспроизводимости
+
+# Настройки тестирования
+testing:
+  test_data_ratio: 0.1
+  validation_data_ratio: 0.2
+  random_seed: 42

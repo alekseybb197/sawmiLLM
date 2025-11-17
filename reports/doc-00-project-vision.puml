@@ -1,0 +1,77 @@
+@startuml
+skinparam shadowing false
+skinparam nodesep 60
+skinparam ranksep 40
+skinparam backgroundColor #FEFEFE
+skinparam dpi 300
+
+' === Блоки ===
+package "Azure DevOps" #LightBlue {
+    [CI/CD Pipelines] as pipelines
+    [Успешные пайплайны\n(логи OK)] as logs_ok
+    [Ошибочные пайплайны\n(логи ERROR)] as logs_err
+}
+
+package "Сбор и предобработка логов" #LightGreen {
+    [Log Collector\n(Azure Monitor / Event Hub)] as collector
+    [Preprocessor\n(очистка, токенизация, фильтрация)] as prep
+}
+
+package "Обучение LogBERT" #Orange {
+    [Только логи OK\n→ нормальные шаблоны] as train_input
+    [LogBERT Model\n(Self-supervised pretraining)] as logbert
+    [Fine-tuning на аномалии\n(опционально с синтетическими ошибками)] as finetune
+}
+
+package "Инференс и детектирование" #Salmon {
+    [Входные логи\n(OK + ERROR)] as infer_input
+    [LogBERT Encoder\n→ векторные представления] as encoder
+    [Anomaly Detector\n(реконструкция + порог)] as detector
+    [Результат: OK / ANOMALY] as result
+}
+
+package "Обработка ошибок и рекомендации" #LightCoral {
+    [Логи с ANOMALY] as anomaly_logs
+    [LLM (e.g. GPT-4 / Llama3)] as llm
+    [Prompt:\n"На основе лога ошибки и контекста пайплайна\nпредложи шаги по исправлению"] as prompt
+    [Рекомендации\n(текстовый отчёт, JIRA, email)] as recom
+}
+
+' === Потоки ===
+pipelines -down-> logs_ok : успешные\nлоги
+pipelines -down-> logs_err : ошибочные\nлоги
+
+logs_ok -down-> collector
+logs_err -down-> collector
+
+collector -down-> prep
+
+' --- Тренировка ---
+prep -down-> train_input : только OK
+train_input -right-> logbert
+logbert -down-> finetune : (опционально)
+finetune -down-> logbert : готово к инференсу
+
+' --- Инференс ---
+prep -down-> infer_input
+infer_input -right-> encoder
+encoder -down-> detector
+detector -down-> result
+
+result -down-> anomaly_logs : если ANOMALY
+result --> [OK → архив] : если OK
+
+' --- Рекомендации ---
+anomaly_logs -right-> llm
+llm -down-> prompt
+prompt -down-> recom
+
+' === Вывод ===
+note right of recom
+  Рекомендации могут быть:
+  - Отправлены в Slack/Teams
+  - Создать задачу в Azure Boards/JIRA
+  - Авто-ремедиация (runbook)
+end note
+
+@enduml

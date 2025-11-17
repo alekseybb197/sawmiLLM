@@ -1,0 +1,322 @@
+@startuml UnifiedLogBERT Full Pipeline with Train Result Block
+
+' === Стили ===
+skinparam defaultFontSize 10
+skinparam defaultFontName Arial
+skinparam rectangle {
+  BorderColor Black
+  BackgroundColor LightCyan
+}
+
+' ========================
+' 0. AZURE DEVOPS API (SOURCE)
+' ========================
+rectangle "Azure DevOps API\n(REST endpoint)" as azure_api
+
+' ========================
+' 1. GET LOGS SCRIPT
+' ========================
+rectangle "get_logs Script\n(REST API Call)" as get_logs
+
+note right of get_logs
+  Operations:\n
+  • Input: pipeline_id, build_id\n
+  • REST API: GET /_apis/build/builds/{buildId}/logs\n
+  • Output: raw log content (as-is)\n
+  • Handles: pagination, authentication, retries\n
+  • Output: raw_logs (with timestamps, ##[section], etc.)
+end note
+
+azure_api --> get_logs : raw log content
+
+' ========================
+' 2. RAW LOGS (ORIGINAL OUTPUT FROM AZURE DEVOPS)
+' ========================
+rectangle "Raw Log Output\n(Original, unprocessed)\n2020-11-12T06:14:33.7066124Z ##[section]Starting: Prepare job Job_1\n2020-11-12T06:14:33.7222246Z ContinueOnError: False\n2020-11-12T06:14:33.7222246Z TimeoutInMinutes: 180\n2020-11-12T06:14:33.7222246Z CancelTimeoutInMinutes: 5\n2020-11-12T06:14:33.7222246Z Expand:\n2020-11-12T06:14:33.7222246Z   ########## System Pipeline Decorator(s) ##########\n\n2020-11-12T06:14:33.7222246Z   Begin evaluating template 'system-pre-steps.yml'\nEvaluating: eq('true', variables['system.debugContext'])\nExpanded: eq('true', Null)\nResult: False\nEvaluating: resources['repositories']['self']\nExpanded: Null\nResult: False\nFinished evaluating template 'system-pre-steps.yml'\n********************************************************************************\nTemplate and static variable resolution complete. Final runtime YAML document:\nsteps: []\n\n2020-11-12T06:14:33.7378501Z   MaxConcurrency: 0\n2020-11-12T06:14:33.7378501Z ##[section]Finishing: Prepare job Job_1" as raw_logs
+
+get_logs --> raw_logs
+
+' ========================
+' 3. CLEAN STEP: REMOVE NOISE
+' ========================
+rectangle "Clean Step\n(Remove Noise)" as clean_step
+
+note right of clean_step
+  Operations:\n
+  • Remove timestamps: \"2020-11-12T...Z\"\n
+  • Remove \"##[section]Finishing: ...\"\n
+  • Remove separators: \"********************************************************************************\"\n
+  • Remove empty lines and extra indentation\n
+  • Preserve only: content lines + \"##[section]Starting: ...\"\n
+  → Output: clean, line-by-line, no metadata
+end note
+
+raw_logs --> clean_step
+
+' ========================
+' 4. PREPARE STEP: STRUCTURE & TAGGING
+' ========================
+rectangle "Prepare Step\n(Structure & Tagging)" as prepare_step
+
+note right of prepare_step
+  Operations:\n
+  • Extract section/task headers: \"##[section]Starting: Prepare job Job_1\" → \"<TFS_Section> Prepare job Job_1\"\n
+  • Normalize dynamic values: \"TimeoutInMinutes: 180\" → \"TimeoutInMinutes: <*>\"\n
+  • Normalize task names: \"Task         : Set build version\" → \"<TFS_Task> Set build version\"\n
+  • Remove redundant prefixes: \"  \" → no leading spaces\n
+  • Output: structured, tag-based log stream\n
+  → No noise, no timestamps, no metadata — only semantic structure
+end note
+
+clean_step --> prepare_step
+
+' ========================
+' 5. CLEANED LOGS (INPUT TO DRAIN3)
+' ========================
+rectangle "Cleaned Log Input\n(pre-processed)\n<TFS_Section> Prepare job Job_1\nContinueOnError: False\nTimeoutInMinutes: <*>\nCancelTimeoutInMinutes: <*>\nExpand:\n<TFS_Decorator>\nBegin evaluating template 'system-pre-steps.yml'\nEvaluating: eq('true', variables['system.debugContext'])\nExpanded: eq('true', Null)\nResult: False\nEvaluating: resources['repositories']['self']\nExpanded: Null\nResult: False\nFinished evaluating template 'system-pre-steps.yml'\nTemplate and static variable resolution complete. Final runtime YAML document:\nsteps: []\nMaxConcurrency: 0" as cleaned_logs
+
+prepare_step --> cleaned_logs
+
+' ========================
+' 6. DRAIN3 OUTPUT FILES
+' ========================
+package "Drain3 Output Files" {
+  rectangle "drain_templates.json\n{ \"E1\": \"<TFS_Section> <*>\",\n  \"E2\": \"ContinueOnError: False\",\n  \"E3\": \"TimeoutInMinutes: <*>\",\n  \"E4\": \"Got build number: <*>\",\n  \"E5\": \"Task was started\",\n  \"E6\": \"Final runtime YAML document: steps: []\" }" as templates
+  rectangle "drain_sequences.jsonl\n{ \"pipeline_id\": \"109952\", \"event_seq\": [\"E2\",\"E3\",\"E4\",\"E5\",\"E6\",...] }" as sequences
+  rectangle "drain_mapping.jsonl\n{ \"event_id\": \"E2\", \"template\": \"ContinueOnError: False\", \"section_name\": \"Prepare job Job_1\" }" as mapping
+  rectangle "drain_state.json\n(compressed tree state)\nSerialized Drain3 tree:\n- depth: 4\n- sim_threshold: 0.6\n- max_children: 200\n- node structure\n→ Used for incremental processing\n→ Restores clustering state" as state
+}
+
+cleaned_logs --> templates : parsed by Drain3
+templates --> mapping : maps template → event_id
+mapping --> sequences : builds event_seq per pipeline
+
+' ========================
+' 7. BUILD VOCAB
+' ========================
+rectangle "build_vocab Script" as build_vocab
+
+note right of build_vocab
+  Operations:\n
+  • Input: drain_templates.json\n
+  • Output: event_vocab.json\n
+  • Special tokens:\n
+    - [PAD] → 0\n
+    - [UNK] → 1\n
+  • Maps: \"E1\" → 2, \"E2\" → 3, ...\n
+  • vocab_size = len(event_ids) + 2\n
+  • Used for tokenizing event_seq
+end note
+
+templates --> build_vocab
+
+' === Vocab as separate element ===
+rectangle "event_vocab.json" as vocab
+
+build_vocab --> vocab
+
+note right of vocab
+  { \"[PAD]\": 0,\n
+    \"[UNK]\": 1,\n
+    \"E1\": 2,\n
+    \"E2\": 3,\n
+    ... }\n
+  → Used to convert event_id → index
+end note
+
+' ========================
+' 8. PREPARE WINDOWS
+' ========================
+rectangle "prepare_windows Script" as prepare_windows
+
+note right of prepare_windows
+  Operations:\n
+  • Input: drain_sequences.jsonl, event_vocab.json\n
+  • Splits: 85% train, 10% val, 5% test\n
+  • Creates sliding windows:\n
+    - window = event_seq[i:i+L]\n
+    - target = event_seq[i+L]\n
+  • Outputs:\n
+    - train.pt, val.pt, test.pt (PyTorch tensors)\n
+    - train_meta.jsonl (metadata per window)\n
+  • Format: torch.save(dataset, 'train.pt')
+end note
+
+sequences --> prepare_windows
+vocab --> prepare_windows
+
+' === PyTorch Dataset as separate element ===
+rectangle "PyTorch Dataset\ntrain.pt / val.pt / test.pt\n(archive with data.pkl, data/0, ...)" as pytorch_dataset
+rectangle "train_meta.jsonl\n{ \"pipeline_id\": \"137437\", \"build_id\": \"26599574\", \"section_name\": \"Download files from Git\", \"section_bucket\": 1481, \"target_pos_in_section\": 64, \"window_idx_in_section\": 0 }\n{ ... }" as meta
+
+prepare_windows --> pytorch_dataset
+prepare_windows --> meta
+
+' ========================
+' 9. MODEL INPUTS
+' ========================
+rectangle "Tokenized Event IDs\ninput_ids = [2,3,4]\n(B=256, L≤512)" as input_tokens
+rectangle "Section Bucket ID\nsec_ids\n(B=256,)\nsection_buckets=2048" as input_bucket
+
+pytorch_dataset --> input_tokens
+meta --> input_bucket
+
+' ========================
+' 10. LOGBERT MODEL BLOCK (CORRECTED)
+' ========================
+package "LogBERT Model" {
+  rectangle "Token Embedding\nvocab_size=V\nd_model=512" as token_emb
+  rectangle "Section Embedding\nnum_emb=2048\ndim=512" as section_emb
+  rectangle "Add Embeddings\n(B, L, 512)" as add_emb
+  rectangle "Positional Embedding\nmax_len=512" as pos_emb
+  rectangle "Transformer Encoder\n6 layers, 8 heads\nFF=2048, dropout=0.1" as transformer
+  rectangle "LayerNorm (last token)\nh[:, -1, :] → (B, 512)" as norm
+  rectangle "LM Head\nLinear(512 → V)" as lm_head
+  rectangle "logits\n(B, V)" as output_logits
+
+  ' === Internal Transformer Nodes (Optional, can be removed for clarity) ===
+  rectangle "Self-Attention\n(Q,K,V)" as att
+  rectangle "FFN\n512→2048→512" as ffn
+
+  ' Training components inside LogBERT
+  rectangle "Loss\nCrossEntropy" as loss
+  rectangle "Optimizer\nAdamW" as optimizer
+  rectangle "Training Config" as train_config
+}
+
+input_tokens --> token_emb : (B,L)
+input_bucket --> section_emb : (B,)
+token_emb --> add_emb : (B,L,512)
+section_emb --> add_emb : (B,1,512) broadcast
+add_emb --> pos_emb : (B,L,512)
+pos_emb --> transformer : (B,L,512)
+
+' === Main data flow ===
+transformer --> norm : (B,L,512) → (B,512)
+norm --> lm_head : (B,512)
+lm_head --> output_logits : (B,V)
+
+' === Internal transformer processes (dotted) ===
+transformer -[#Blue,dotted]-> att
+att -[#Blue,dotted]-> ffn
+
+' === Training flow ===
+output_logits --> loss : logits (B,V)
+loss --> optimizer : loss.backward()
+optimizer --> train_config : update weights
+
+' === Arrows with Colors ===
+azure_api -[#Blue]-> get_logs : REST API call
+get_logs -[#Orange]-> raw_logs : raw log content
+raw_logs -[#Orange]-> clean_step : noisy, timestamped, unstructured
+clean_step -[#DarkGreen]-> prepare_step : stripped, line-based
+prepare_step -[#DarkGreen]-> cleaned_logs : structured, tag-based
+
+templates -[#Purple]-> build_vocab : list of event templates
+build_vocab -[#Purple]-> vocab : event_vocab.json
+
+sequences -[#Teal]-> prepare_windows : event sequences
+vocab -[#Teal]-> prepare_windows : mapping
+prepare_windows -[#Teal]-> pytorch_dataset : train.pt, val.pt, test.pt
+prepare_windows -[#Teal]-> meta : train_meta.jsonl
+
+pytorch_dataset -[#DarkGreen]-> input_tokens : input_ids
+meta -[#DarkGreen]-> input_bucket : sec_ids
+
+' ========================
+' 11. TRAINING OUTPUT ARTIFACTS
+' ========================
+rectangle "model.pt" as model_pt
+rectangle "optimizer.pt" as optimizer_pt
+rectangle "scaler.pt" as scaler_pt
+
+train_config --> model_pt : torch.save(model.state_dict())
+train_config --> optimizer_pt : torch.save(optimizer.state_dict())
+train_config --> scaler_pt : torch.save(scaler.state_dict()) ' for AMP
+
+' ========================
+' 12. QUANTIZATION STEP
+' ========================
+rectangle "Quantize to INT8\n(torch.quantization)" as quantize
+
+model_pt --> quantize
+
+rectangle "model_quant.pt" as model_quant_pt
+
+quantize --> model_quant_pt
+
+' ========================
+' 13. TRAIN RESULT BLOCK
+' ========================
+package "Train Result" {
+  rectangle "model_quant.pt" as model_quant_pt_block
+  rectangle "event_vocab.json" as vocab_block
+  rectangle "drain_state.json" as state_block
+  rectangle "drain_templates.json" as templates_block
+}
+
+model_quant_pt --> model_quant_pt_block
+vocab --> vocab_block
+state --> state_block
+templates --> templates_block
+
+' === NOTES ===
+note right of pytorch_dataset
+  PyTorch dataset archive:\n
+  train.pt:\n
+    - data.pkl: metadata\n
+    - data/0, data/1, ...: tensor shards\n
+    - version, byteorder, etc.\n
+  → Loaded via torch.load()
+end note
+
+note right of meta
+  Metadata per window:\n
+  • pipeline_id, build_id\n
+  • section_name → section_bucket\n
+  • target_pos_in_section: position of target token\n
+  • window_idx_in_section: window index\n
+  → Used to inject section context
+end note
+
+note right of train_config
+  Training Parameters:\n
+  • batch_size: 256\n
+  • lr: 1e-4\n
+  • weight_decay: 0.01\n
+  • grad_clip: 1.0\n
+  • amp: true\n
+  • seed: 42
+end note
+
+note right of model_pt
+  Trained model weights:\n
+  • state_dict()\n
+  • Contains embeddings, transformer, LM head
+end note
+
+note right of optimizer_pt
+  Optimizer state:\n
+  • AdamW momentum, variance\n
+  • Enables resume training
+end note
+
+note right of scaler_pt
+  AMP scaler state:\n
+  • Loss scaling factor\n
+  • Prevents underflow in FP16
+end note
+
+note right of quantize
+  Quantization:\n
+  • Converts FP32 → INT8\n
+  • Reduces model size by ~4x\n
+  • Speeds up inference\n
+  • Uses torch.quantization\n
+  → Output: model_quant.pt
+end note
+
+caption UnifiedLogBERT: Full end-to-end pipeline with Train Result block\nAzure DevOps → Raw Logs → Clean → Prepare → Drain3 → Vocab → Windows → LogBERT (with training) → Train Result (model + vocab + drain files)
+footer Created: November 10, 2025 | Includes training output and quantization
+
+@enduml

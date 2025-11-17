@@ -1,0 +1,29 @@
+.DS_Store
+
+# ------ python
+.env
+.mypy_cache
+venv/
+modules/__pycache__/
+__pycache__/
+
+# ------ outputs
+*.csv
+*.json
+*.lst
+*.log
+*.txt
+*.raw
+*.dat
+
+# ------ archive
+old/
+failed/
+succeeded/
+tfslogs/
+logs/
+checkpoints/
+dataset/
+tmp/
+source/
+history/

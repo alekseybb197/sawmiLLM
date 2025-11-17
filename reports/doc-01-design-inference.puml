@@ -1,0 +1,265 @@
+@startuml UnifiedLogBERT Inference and Anomaly Detection Flow
+
+' === Стили ===
+skinparam defaultFontSize 10
+skinparam defaultFontName Arial
+skinparam rectangle {
+  BorderColor Black
+  BackgroundColor LightCyan
+}
+
+' ========================
+' 0. SOURCE: ERROR LOGS
+' ========================
+rectangle "Error Logs\n(From Azure DevOps builds with failure)" as error_logs
+
+note right of error_logs
+  Example:\n
+  2020-11-12T06:14:33.7066124Z ##[section]Starting: Prepare job Job_1\n
+  2020-11-12T06:14:33.7222246Z ContinueOnError: False\n
+  2020-11-12T06:14:33.7222246Z TimeoutInMinutes: 180\n
+  2020-11-12T06:14:33.7222246Z CancelTimeoutInMinutes: 5\n
+  ...
+  2020-11-12T06:14:33.7222246Z ##[error]The process cannot access the file...\n
+  ...
+end note
+
+' ========================
+' 1. GET ERROR LOGS SCRIPT
+' ========================
+rectangle "get_error_logs Script\n(REST API Call)" as get_error_logs
+
+note right of get_error_logs
+  Operations:\n
+  • Input: pipeline_id, build_id\n
+  • REST API: GET /_apis/build/builds/{buildId}/logs\n
+  • Filter: only builds with status=failed\n
+  • Output: error_logs.txt
+end note
+
+error_logs --> get_error_logs
+
+' ========================
+' 2. CLEAN STEP: REMOVE NOISE
+' ========================
+rectangle "Clean Step\n(Remove Noise)" as clean_step_error
+
+note right of clean_step_error
+  Operations:\n
+  • Remove timestamps: \"2020-11-12T...Z\"\n
+  • Remove \"##[section]Finishing: ...\"\n
+  • Remove separators: \"********************************************************************************\"\n
+  • Preserve only: content lines + \"##[section]Starting: ...\" + \"##[error]...\"\n
+  → Output: clean, line-by-line, no metadata
+end note
+
+get_error_logs --> clean_step_error
+
+' ========================
+' 3. PREPARE STEP: STRUCTURE & TAGGING
+' ========================
+rectangle "Prepare Step\n(Structure & Tagging)" as prepare_step_error
+
+note right of prepare_step_error
+  Operations:\n
+  • Extract section/task headers: \"##[section]Starting: Prepare job Job_1\" → \"<TFS_Section> Prepare job Job_1\"\n
+  • Normalize dynamic values: \"TimeoutInMinutes: 180\" → \"TimeoutInMinutes: <*>\"\n
+  • Normalize error messages: \"##[error] The process...\" → \"<TFS_Error> The process cannot access the file\"\n
+  • Output: structured, tag-based log stream\n
+  → No noise, no timestamps, no metadata — only semantics
+end note
+
+clean_step_error --> prepare_step_error
+
+' ========================
+' 4. CLEANED ERROR LOGS
+' ========================
+rectangle "Cleaned Error Log Input\n(pre-processed)\n<TFS_Section> Prepare job Job_1\nContinueOnError: False\nTimeoutInMinutes: <*>\n<TFS_Error> The process cannot access the file...\n..." as cleaned_error_logs
+
+prepare_step_error --> cleaned_error_logs
+
+' ========================
+' 5. DRAIN3 (USING TRAINED STATE & TEMPLATES)
+' ========================
+package "Drain3 (Inference)" {
+  rectangle "drain_state.json\n(loaded from Train Result)" as drain_state_infer
+  rectangle "drain_templates.json\n(loaded from Train Result)" as drain_templates_infer
+  rectangle "drain_sequences.jsonl\n{ \"pipeline_id\": \"109952\", \"event_seq\": [\"E2\",\"E3\",\"E4\",\"E5\",\"E6\",...] }" as drain_sequences_infer
+  rectangle "drain_mapping.jsonl\n{ \"event_id\": \"E2\", \"template\": \"ContinueOnError: False\", \"section_name\": \"Prepare job Job_1\" }" as drain_mapping_infer
+}
+
+cleaned_error_logs --> drain_state_infer : restored state
+cleaned_error_logs --> drain_templates_infer : restored templates
+drain_state_infer --> drain_sequences_infer : event_seq
+drain_templates_infer --> drain_mapping_infer : event_id mapping
+
+' ========================
+' 6. BUILD VOCAB (USING TRAINED VOCAB)
+' ========================
+rectangle "event_vocab.json\n(loaded from Train Result)" as vocab_infer
+
+drain_templates_infer --> vocab_infer
+
+' ========================
+' 7. PREPARE INPUT FOR MODEL
+' ========================
+rectangle "prepare_windows_for_inference Script" as prepare_infer
+
+note right of prepare_infer
+  Operations:\n
+  • Input: drain_sequences.jsonl, event_vocab.json\n
+  • Creates sliding windows:\n
+    - window = event_seq[i:i+L]\n
+    - target = event_seq[i+L]\n
+  • Output: PyTorch tensors for inference\n
+  • Format: torch.tensor(input_ids), torch.tensor(sec_ids)
+end note
+
+drain_sequences_infer --> prepare_infer
+vocab_infer --> prepare_infer
+
+' === Output Nodes ===
+rectangle "input_ids_for_inference\n(B, L)" as input_ids_inf
+rectangle "sec_ids_for_inference\n(B,)" as sec_ids_inf
+
+prepare_infer --> input_ids_inf
+prepare_infer --> sec_ids_inf
+
+' ========================
+' 8. INFERENCE MODEL
+' ========================
+package "LogBERT Inference Model" {
+  rectangle "model_quant.pt\n(loaded from Train Result)" as model_quant_infer
+  rectangle "Token Embedding\nvocab_size=V\nd_model=512" as token_emb_inf
+  rectangle "Section Embedding\nnum_emb=2048\ndim=512" as section_emb_inf
+  rectangle "Add Embeddings\n(B, L, 512)" as add_emb_inf
+  rectangle "Positional Embedding\nmax_len=512" as pos_emb_inf
+  rectangle "Transformer Encoder\n6 layers, 8 heads\nFF=2048, dropout=0.1" as transformer_inf
+  rectangle "LayerNorm (last token)\nh[:, -1, :] → (B, 512)" as norm_inf
+  rectangle "LM Head\nLinear(512 → V)" as lm_head_inf
+  rectangle "logits\n(B, V)" as output_logits_inf
+  rectangle "predicted_event_id\n(B,)" as pred_event_id
+}
+
+input_ids_inf --> token_emb_inf : (B,L)
+sec_ids_inf --> section_emb_inf : (B,)
+token_emb_inf --> add_emb_inf : (B,L,512)
+section_emb_inf --> add_emb_inf : (B,1,512) broadcast
+add_emb_inf --> pos_emb_inf : (B,L,512)
+pos_emb_inf --> transformer_inf : (B,L,512)
+
+' === Main data flow ===
+transformer_inf --> norm_inf : (B,L,512) → (B,512)
+norm_inf --> lm_head_inf : (B,512)
+lm_head_inf --> output_logits_inf : (B,V)
+
+' === Predict next event ===
+output_logits_inf --> pred_event_id : argmax(logits)
+
+' === Load trained model ===
+model_quant_infer --> token_emb_inf : load weights
+model_quant_infer --> section_emb_inf : load weights
+model_quant_infer --> transformer_inf : load weights
+model_quant_infer --> lm_head_inf : load weights
+
+' ========================
+' 9. ANOMALY DETECTION
+' ========================
+rectangle "Anomaly Detection\nCompare: predicted vs actual" as anomaly_det
+
+note right of anomaly_det
+  Operations:\n
+  • Compare: pred_event_id vs actual_event_id\n
+  • If: pred_event_id != actual_event_id → anomaly detected\n
+  • Log: pipeline_id, build_id, position, expected, actual\n
+  → Output: anomalies.jsonl
+end note
+
+' === Anomaly Output as separate element ===
+rectangle "anomalies.jsonl\n{ \"pipeline_id\": \"109952\", \"build_id\": \"5813854\", \"position\": 64, \"expected\": \"E4\", \"actual\": \"E99\", \"confidence\": 0.1 }\n{ ... }" as anomalies_out
+
+pred_event_id --> anomaly_det : predicted
+drain_sequences_infer --> anomaly_det : actual sequence
+anomaly_det --> anomalies_out
+
+' ========================
+' 10. RECONSTRUCT LOGS WITH ANOMALIES
+' ========================
+rectangle "Reconstruct Logs\nwith Anomalies" as reconstruct_logs
+
+note right of reconstruct_logs
+  Operations:\n
+  • Input: \n
+    - drain_sequences.jsonl\n
+    - drain_mapping.jsonl\n
+    - anomalies.jsonl\n
+    - drain_templates.json\n
+  • For each event_id in sequence:\n
+    - Get template from drain_templates.json\n
+    - Get original_line from drain_mapping.jsonl\n
+    - If position in anomalies.jsonl → mark as [ANOMALY]\n
+  • Output: human-readable log with highlights
+end note
+
+drain_sequences_infer --> reconstruct_logs
+drain_mapping_infer --> reconstruct_logs
+anomalies_out --> reconstruct_logs
+drain_templates_infer --> reconstruct_logs
+
+' === Reconstructed Logs as separate element ===
+rectangle "Reconstructed Log Output\n<TFS_Section> Prepare job Job_1\nContinueOnError: False\nTimeoutInMinutes: <*>\n[TFS_Error] The process cannot access the file...\n[ANOMALY] <TFS_Task> Unexpected task execution: CleanupTempFiles\n[ANOMALY] <TFS_Decorator> Failed to initialize decorator\n..." as reconstructed_logs
+
+reconstruct_logs --> reconstructed_logs
+
+' === Arrows with Colors ===
+error_logs -[#Blue]-> get_error_logs : error log content
+get_error_logs -[#Orange]-> clean_step_error : raw logs
+clean_step_error -[#DarkGreen]-> prepare_step_error : cleaned logs
+prepare_step_error -[#DarkGreen]-> cleaned_error_logs : structured logs
+
+cleaned_error_logs -[#Teal]-> drain_state_infer : restore state
+cleaned_error_logs -[#Teal]-> drain_templates_infer : restore templates
+
+drain_sequences_infer -[#Purple]-> prepare_infer : event sequences
+vocab_infer -[#Purple]-> prepare_infer : vocab mapping
+
+prepare_infer -[#DarkGreen]-> input_ids_inf : input_ids
+prepare_infer -[#DarkGreen]-> sec_ids_inf : sec_ids
+
+input_ids_inf -[#DarkGreen]-> token_emb_inf : (B,L)
+sec_ids_inf -[#DarkGreen]-> section_emb_inf : (B,)
+
+pred_event_id -[#Red,thickness=2]-> anomaly_det : anomaly check
+drain_sequences_infer -[#Red,thickness=2]-> anomaly_det : ground truth
+
+anomalies_out -[#Magenta]-> reconstruct_logs : anomaly positions
+
+' === NOTES ===
+note right of model_quant_infer
+  Quantized model:\n
+  • model_quant.pt\n
+  • Loaded in inference mode\n
+  • Fast and memory-efficient
+end note
+
+note right of anomalies_out
+  Anomaly report:\n
+  • pipeline_id, build_id\n
+  • position in sequence\n
+  • expected vs actual event_id\n
+  • confidence score\n
+  → Used for alerting / debugging
+end note
+
+note right of reconstructed_logs
+  Final output:\n
+  • Human-readable log\n
+  • Dynamic values replaced with <*>\n
+  • Anomalous lines marked with [ANOMALY]\n
+  → Ready for review by DevOps/SRE
+end note
+
+caption UnifiedLogBERT: Inference and Anomaly Detection Flow\nError Logs → Clean → Prepare → Drain3 → Model → Anomaly Detection → Reconstructed Log with Highlights
+footer Created: November 10, 2025 | Full pipeline for log anomaly detection and reporting
+
+@enduml

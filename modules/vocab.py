@@ -1,0 +1,209 @@
+# -*- coding: utf-8 -*-
+"""
+modules/vocab.py — построение словаря событий Drain для LogBERT.
+
+Функции:
+  - build_event_vocab: из success JSONL и drain_templates.json собирает словарь событий (E###)
+    и сохраняет event_vocab.json + event_vocab_stats.json
+
+Особенности:
+  - Использует только status == "success".
+  - Специальные токены: [PAD]=0, [UNK]=1.
+  - Детерминированная сортировка событий (по частоте, затем лексикографически).
+  - Поддержка min_support и exclude_patterns для фильтрации.
+  - Отчёт со статистикой частот, фильтрацией и отладочной информацией.
+
+Зависимости: только стандартная библиотека + modules.logger / modules.utils.
+"""
+from __future__ import annotations
+import json
+import re
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from collections import Counter
+from typing import List, Dict, Tuple, Any, Iterable
+
+from modules.logger import get_logger
+from modules.utils import ensure_dir
+
+log = get_logger(__name__)
+
+PAD_ID = 0
+UNK_ID = 1
+SPECIAL_TOKENS = {"[PAD]": PAD_ID, "[UNK]": UNK_ID}
+EVENT_RE = re.compile(r"^E\d+$")
+
+
+@dataclass
+class VocabStats:
+    total_files: int
+    total_records: int
+    success_records: int
+    unique_events: int
+    used_templates: int
+    filtered_by_pattern: int
+    filtered_by_support: int
+    event_freq_top10: List[Tuple[str, int]]
+    malformed_records: int
+    non_event_tokens: int
+    min_support: int
+    exclude_patterns: List[str]
+
+
+def _iter_jsonl(path: Path) -> Iterable[dict]:
+    with path.open("r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, 1):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                yield json.loads(s)
+            except Exception as e:
+                log.warning(f"{path}:{ln}: JSON parse error: {e}")
+                continue
+
+
+def _gather_jsonl(paths: List[Path]) -> List[Path]:
+    out: List[Path] = []
+    for p in paths:
+        if p.is_dir():
+            out.extend(sorted(p.rglob("*.jsonl")))
+        elif p.is_file():
+            out.append(p)
+        else:
+            log.warning(f"Path not found: {p}")
+    return out
+
+
+def build_event_vocab(
+    inputs: List[Path],
+    outdir: Path,
+    drain_templates_path: Path | None = None,
+    min_support: int = 1,
+    exclude_patterns: List[str] | None = None,
+) -> Tuple[Path, Path]:
+    """Строит словарь событий из success-записей + drain_templates.json.
+
+    :param inputs: список путей к JSONL файлам или директориям
+    :param outdir: папка для сохранения event_vocab.json и event_vocab_stats.json
+    :param drain_templates_path: путь к drain_templates.json (по умолчанию ./drain_templates.json)
+    :param min_support: минимальная частота включения события
+    :param exclude_patterns: список regex паттернов для фильтрации шаблонов
+    :return: (path_to_vocab_json, path_to_stats_json)
+    """
+    ensure_dir(outdir)
+    jsonl_files = _gather_jsonl(inputs)
+    if not jsonl_files:
+        raise FileNotFoundError("No JSONL files found in provided inputs")
+
+    log.info(f"[Vocab] Scanning {len(jsonl_files)} files…")
+
+    # === 1. Сбор частот из JSONL ===
+    freq: Counter[str] = Counter()
+    total_records = 0
+    success_records = 0
+    malformed = 0
+    non_event_tokens = 0
+
+    for fp in jsonl_files:
+        for rec in _iter_jsonl(fp):
+            total_records += 1
+            if rec.get("status") != "success":
+                continue
+            success_records += 1
+            ev = rec.get("event_seq")
+            if not isinstance(ev, list):
+                malformed += 1
+                continue
+            for tok in ev:
+                if not isinstance(tok, str) or not EVENT_RE.match(tok):
+                    non_event_tokens += 1
+                    continue
+                freq[tok] += 1
+
+    # === 2. Загрузка шаблонов Drain ===
+    drain_templates_path = drain_templates_path or Path("drain_templates.json")
+    if not drain_templates_path.exists():
+        raise FileNotFoundError(f"Drain templates not found: {drain_templates_path}")
+    with drain_templates_path.open("r", encoding="utf-8") as f:
+        templates: Dict[str, Any] = json.load(f)
+
+    # === 3. Подготовка фильтров ===
+    exclude_patterns = exclude_patterns or [
+        r"<TFS_Section>",
+        r"##\[debug\]",
+        r"Environment",
+        r"Variable",
+        r"proxy",
+        r"agent",
+        r"cleanup",
+    ]
+    compiled_excludes = [re.compile(p, re.IGNORECASE) for p in exclude_patterns]
+
+    def is_excluded(template_text: str) -> bool:
+        return any(p.search(template_text) for p in compiled_excludes)
+
+    # === 4. Фильтрация шаблонов ===
+    filtered_by_pattern = 0
+    filtered_by_support = 0
+    used_templates = 0
+    filtered_templates: Dict[str, Dict[str, Any]] = {}
+
+    for eid, tpl in templates.items():
+        tpl_str = tpl["template"] if isinstance(tpl, dict) and "template" in tpl else str(tpl)
+        freq_val = freq.get(eid, 0)
+        if freq_val < min_support:
+            filtered_by_support += 1
+            continue
+        if is_excluded(tpl_str):
+            filtered_by_pattern += 1
+            continue
+        used_templates += 1
+        filtered_templates[eid] = {"template": tpl_str, "freq": freq_val}
+
+    # === 5. Формирование словаря ===
+    sorted_items = sorted(filtered_templates.items(), key=lambda x: (-x[1]["freq"], x[0]))
+    vocab = {**SPECIAL_TOKENS}
+    for i, (eid, _) in enumerate(sorted_items, start=len(SPECIAL_TOKENS)):
+        vocab[eid] = i
+
+    # === 6. Сохранение ===
+    vocab_path = outdir / "event_vocab.json"
+    stats_path = outdir / "event_vocab_stats.json"
+
+    with vocab_path.open("w", encoding="utf-8") as f:
+        json.dump(vocab, f, ensure_ascii=False, indent=2)
+
+    top10 = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]
+    stats = VocabStats(
+        total_files=len(jsonl_files),
+        total_records=total_records,
+        success_records=success_records,
+        unique_events=len(freq),
+        used_templates=used_templates,
+        filtered_by_pattern=filtered_by_pattern,
+        filtered_by_support=filtered_by_support,
+        event_freq_top10=top10,
+        malformed_records=malformed,
+        non_event_tokens=non_event_tokens,
+        min_support=min_support,
+        exclude_patterns=exclude_patterns,
+    )
+    with stats_path.open("w", encoding="utf-8") as f:
+        json.dump(asdict(stats), f, ensure_ascii=False, indent=2)
+
+    log.info(
+        f"[Vocab] Built {len(vocab)} tokens (incl specials). "
+        f"Used templates={used_templates}/{len(templates)}. "
+        f"Min_support={min_support}. Saved: {vocab_path}"
+    )
+    if filtered_by_pattern or filtered_by_support:
+        log.warning(
+            f"[Vocab] Filtered {filtered_by_pattern} by pattern, {filtered_by_support} by support. "
+            f"See {stats_path}"
+        )
+    if malformed or non_event_tokens:
+        log.warning(
+            f"[Vocab] Malformed={malformed}, non_event_tokens={non_event_tokens}. See {stats_path}"
+        )
+    return vocab_path, stats_path

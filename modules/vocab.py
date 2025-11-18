@@ -80,15 +80,21 @@ def build_event_vocab(
     outdir: Path,
     drain_templates_path: Path | None = None,
     min_support: int = 1,
-    exclude_patterns: List[str] | None = None,
+    exclude_patterns: List[str] | None = None,  # Игнорируется, оставлено для совместимости
 ) -> Tuple[Path, Path]:
     """Строит словарь событий из success-записей + drain_templates.json.
 
+    ВАЖНО: 
+    - Частоты считаются ТОЛЬКО из success-записей (status == "success")
+    - События, которые встречаются только в error-записях, НЕ попадут в словарь
+    - Если событие есть в drain_templates.json, но не встречалось в success-записях,
+      оно будет включено в словарь только если min_support = 0 (не рекомендуется)
+    
     :param inputs: список путей к JSONL файлам или директориям
     :param outdir: папка для сохранения event_vocab.json и event_vocab_stats.json
     :param drain_templates_path: путь к drain_templates.json (по умолчанию ./drain_templates.json)
-    :param min_support: минимальная частота включения события
-    :param exclude_patterns: список regex паттернов для фильтрации шаблонов
+    :param min_support: минимальная частота включения события (из success-записей)
+    :param exclude_patterns: ИГНОРИРУЕТСЯ (удалено из логики)
     :return: (path_to_vocab_json, path_to_stats_json)
     """
     ensure_dir(outdir)
@@ -98,17 +104,21 @@ def build_event_vocab(
 
     log.info(f"[Vocab] Scanning {len(jsonl_files)} files…")
 
-    # === 1. Сбор частот из JSONL ===
+    # === 1. Сбор частот из JSONL (ТОЛЬКО success-записи) ===
     freq: Counter[str] = Counter()
     total_records = 0
     success_records = 0
+    error_records = 0
     malformed = 0
     non_event_tokens = 0
 
     for fp in jsonl_files:
         for rec in _iter_jsonl(fp):
             total_records += 1
-            if rec.get("status") != "success":
+            status = rec.get("status", "unknown")
+            if status != "success":
+                if status == "error":
+                    error_records += 1
                 continue
             success_records += 1
             ev = rec.get("event_seq")
@@ -121,6 +131,11 @@ def build_event_vocab(
                     continue
                 freq[tok] += 1
 
+    log.info(
+        f"[Vocab] Records: total={total_records}, success={success_records}, "
+        f"error={error_records}, malformed={malformed}"
+    )
+
     # === 2. Загрузка шаблонов Drain ===
     drain_templates_path = drain_templates_path or Path("drain_templates.json")
     if not drain_templates_path.exists():
@@ -128,23 +143,7 @@ def build_event_vocab(
     with drain_templates_path.open("r", encoding="utf-8") as f:
         templates: Dict[str, Any] = json.load(f)
 
-    # === 3. Подготовка фильтров ===
-    exclude_patterns = exclude_patterns or [
-        r"<TFS_Section>",
-        r"##\[debug\]",
-        r"Environment",
-        r"Variable",
-        r"proxy",
-        r"agent",
-        r"cleanup",
-    ]
-    compiled_excludes = [re.compile(p, re.IGNORECASE) for p in exclude_patterns]
-
-    def is_excluded(template_text: str) -> bool:
-        return any(p.search(template_text) for p in compiled_excludes)
-
-    # === 4. Фильтрация шаблонов ===
-    filtered_by_pattern = 0
+    # === 3. Фильтрация шаблонов (только по min_support) ===
     filtered_by_support = 0
     used_templates = 0
     filtered_templates: Dict[str, Dict[str, Any]] = {}
@@ -152,12 +151,13 @@ def build_event_vocab(
     for eid, tpl in templates.items():
         tpl_str = tpl["template"] if isinstance(tpl, dict) and "template" in tpl else str(tpl)
         freq_val = freq.get(eid, 0)
+        
+        # ВАЖНО: если событие не встречалось в success-записях, freq_val = 0
+        # При min_support = 1 такие события будут отфильтрованы
         if freq_val < min_support:
             filtered_by_support += 1
             continue
-        if is_excluded(tpl_str):
-            filtered_by_pattern += 1
-            continue
+        
         used_templates += 1
         filtered_templates[eid] = {"template": tpl_str, "freq": freq_val}
 
@@ -181,13 +181,13 @@ def build_event_vocab(
         success_records=success_records,
         unique_events=len(freq),
         used_templates=used_templates,
-        filtered_by_pattern=filtered_by_pattern,
+        filtered_by_pattern=0,  # Больше не используется
         filtered_by_support=filtered_by_support,
         event_freq_top10=top10,
         malformed_records=malformed,
         non_event_tokens=non_event_tokens,
         min_support=min_support,
-        exclude_patterns=exclude_patterns,
+        exclude_patterns=[],  # Больше не используется
     )
     with stats_path.open("w", encoding="utf-8") as f:
         json.dump(asdict(stats), f, ensure_ascii=False, indent=2)
@@ -197,10 +197,22 @@ def build_event_vocab(
         f"Used templates={used_templates}/{len(templates)}. "
         f"Min_support={min_support}. Saved: {vocab_path}"
     )
-    if filtered_by_pattern or filtered_by_support:
+    
+    if filtered_by_support > 0:
         log.warning(
-            f"[Vocab] Filtered {filtered_by_pattern} by pattern, {filtered_by_support} by support. "
+            f"[Vocab] Filtered {filtered_by_support} events by min_support={min_support}. "
+            f"These events did not appear in success records (or appeared < {min_support} times). "
             f"See {stats_path}"
+        )
+        log.warning(
+            f"[Vocab] ⚠️  ВНИМАНИЕ: Отфильтрованные события НЕ будут включены в словарь. "
+            f"Если они присутствуют в train/val данных, записи с ними будут пропущены при создании тензоров. "
+            f"[UNK] используется только для аномалий и не должен появляться в обучающих данных."
+        )
+        log.warning(
+            f"[Vocab] 💡 Подсказка: Если нужно включить все события из drain_templates.json, "
+            f"установите min_support=0 (не рекомендуется, так как может включить события, "
+            f"которые не встречались в success-записях)."
         )
     if malformed or non_event_tokens:
         log.warning(

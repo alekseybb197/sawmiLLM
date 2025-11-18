@@ -19,45 +19,17 @@ from modules.windowing import prepare_windows
 from modules.config import get_config, Config
 from modules.logger import get_logger
 from modules.utils import ensure_dir
+from modules.paths import (
+    get_vocab_path_from_config,
+    get_dataset_path_from_config,
+    get_window_size_from_config,
+    get_inputs_from_drain_list,
+)
 
 log = get_logger(__name__)
 
 
-def _get_inputs_from_config(cfg: Config) -> List[Path]:
-    """Получает список входных файлов из dataset.drain_list."""
-    drain_list = cfg.get("dataset.drain_list", [])
-    if not drain_list:
-        return []
-    
-    inputs = []
-    for path_str in drain_list:
-        path = Path(path_str)
-        if path.exists():
-            inputs.append(path)
-        else:
-            log.warning(f"Input file not found: {path}")
-    return inputs
-
-
-def _get_vocab_path_from_config(cfg: Config) -> Path | None:
-    """Получает путь к словарю из dataset.vocab/event_vocab.json."""
-    vocab_dir = cfg.get("dataset.vocab")
-    if not vocab_dir:
-        return None
-    vocab_path = Path(vocab_dir) / "event_vocab.json"
-    return vocab_path if vocab_path.exists() else None
-
-
-def _get_output_dir_from_config(cfg: Config) -> Path | None:
-    """Получает директорию для вывода из dataset.dataset."""
-    dataset_dir = cfg.get("dataset.dataset")
-    return Path(dataset_dir) if dataset_dir else None
-
-
-def _get_window_size_from_config(cfg: Config) -> int:
-    """Получает размер окна из dataset.windows.size."""
-    window_size = cfg.get("dataset.windows.size", 64)
-    return int(window_size)
+# Функции _get_*_from_config теперь импортируются из modules.paths
 
 
 def main():
@@ -97,7 +69,7 @@ def main():
     # Определяем входные файлы
     inputs = list(args.inputs) if args.inputs else []
     if not inputs:
-        inputs = _get_inputs_from_config(cfg)
+        inputs = get_inputs_from_drain_list(cfg)
         if inputs:
             log.info(f"Inputs from config: {[str(p) for p in inputs]}")
     
@@ -107,7 +79,7 @@ def main():
     # Определяем путь к словарю
     vocab_path = args.vocab
     if vocab_path is None:
-        vocab_path_cfg = _get_vocab_path_from_config(cfg)
+        vocab_path_cfg = get_vocab_path_from_config(cfg)
         if vocab_path_cfg:
             vocab_path = vocab_path_cfg
             log.info(f"Vocab path from config: {vocab_path}")
@@ -120,7 +92,7 @@ def main():
     # Определяем директорию для вывода
     out_dir = args.out_dir
     if out_dir is None:
-        out_dir_cfg = _get_output_dir_from_config(cfg)
+        out_dir_cfg = get_dataset_path_from_config(cfg, "dataset")
         if out_dir_cfg:
             out_dir = out_dir_cfg
             log.info(f"Output dir from config: {out_dir}")
@@ -132,7 +104,7 @@ def main():
     # Определяем размер окна
     window_size = args.window_size
     if window_size is None:
-        window_size = _get_window_size_from_config(cfg)
+        window_size = get_window_size_from_config(cfg)
         log.info(f"Window size from config: {window_size}")
 
     # Загружаем словарь

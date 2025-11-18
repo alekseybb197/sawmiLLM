@@ -42,6 +42,8 @@ from drain3.template_miner_config import TemplateMinerConfig # type: ignore[impo
 
 from modules.config import get_config
 from modules.logger import get_logger
+from modules.sections import parse_sections_from_lines, chunk_sequence
+from modules.paths import parse_filename
 
 
 # ---------------------------------------------------------
@@ -93,73 +95,6 @@ def load_config() -> dict:
         # Drain3
         "drain3_config": drain_cfg,
     }
-
-
-# ---------------------------------------------------------
-# Разметка секций
-# ---------------------------------------------------------
-def parse_sections_from_lines(lines: List[str], sect_cfg: Dict[str, Any]) -> Dict[str, List[str]]:
-    use_azure = sect_cfg.get("use_azure_sections", True)
-    use_tfs = sect_cfg.get("use_tfs_sections", True)
-    tfs_pat = re.compile(sect_cfg.get("tfs_regex", r"<TFS_Section>\s*(.+)"))
-    sections: Dict[str, List[str]] = {}
-    current_name = ""
-    current_lines: List[str] = []
-
-    def _push():
-        nonlocal current_name, current_lines
-        if current_name and current_lines:
-            name = current_name
-            idx = 2
-            while name in sections:
-                name = f"{current_name}#{idx}"
-                idx += 1
-            sections[name] = current_lines
-        current_name, current_lines = "", []
-
-    for line in lines:
-        stripped = line.strip()
-
-        # Azure DevOps
-        if use_azure and "##[section]Starting:" in stripped:
-            _push()
-            current_name = stripped.split("##[section]Starting:")[-1].strip()
-            current_lines = []
-            continue
-        if use_azure and "##[section]Finishing:" in stripped:
-            _push()
-            continue
-
-        # TFS
-        if use_tfs:
-            m = tfs_pat.search(stripped)
-            if m:
-                _push()
-                current_name = m.group(1).strip()
-                current_lines = []
-                continue
-        if current_name:
-            current_lines.append(stripped)
-    _push()
-    return sections or {"full": lines}
-
-
-# ---------------------------------------------------------
-# Чанкование
-# ---------------------------------------------------------
-def chunk_sequence(seq: List[str], max_len: int, stride: int, min_len: int) -> List[List[str]]:
-    if len(seq) == 0:
-        return []
-    if len(seq) <= max_len:
-        return [seq] if len(seq) >= min_len else []
-    chunks = []
-    for i in range(0, len(seq), stride):
-        ch = seq[i:i + max_len]
-        if len(ch) >= min_len:
-            chunks.append(ch)
-        if i + max_len >= len(seq):
-            break
-    return chunks
 
 
 # ---------------------------------------------------------
@@ -362,9 +297,7 @@ def encode_logs(cfg: dict, logger, append_mode: bool = False):
     dropped = 0
 
     for path in tqdm(prepared_files, desc="Encode Logs"):
-        parts = path.stem.split('-')
-        pipeline_id = parts[0]
-        build_id = parts[1] if len(parts) > 1 else "unknown"
+        pipeline_id, build_id = parse_filename(path)
         with open(path, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f if l.strip()]
 

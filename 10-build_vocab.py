@@ -33,6 +33,7 @@ import typer
 from modules.logger import get_logger
 from modules.utils import ensure_dir
 from modules.vocab import build_event_vocab
+from modules.paths import get_input_files_from_config
 
 log = get_logger(__name__)
 
@@ -43,52 +44,7 @@ def load_config(path: Path) -> Dict[Any, Any]:
         return cast(Dict[Any, Any], yaml.safe_load(f))
 
 
-def _inputs_from_config(cfg: dict, for_split: bool = False) -> List[Path]:
-    """
-    Извлекает входные JSONL файлы из конфига.
-    
-    Args:
-        cfg: Конфигурация из config.yaml
-        for_split: Если True, использует dataset.drain_chunks для разделения датасета
-                   Если False, использует vocab_list для построения словаря
-    
-    Returns:
-        Список путей к входным файлам
-    """
-    ds = cfg.get("dataset", {})
-    out: List[Path] = []
-
-    if for_split:
-        # Для разделения датасета используем dataset.drain_chunks
-        drain_chunks = ds.get("drain_chunks")
-        if isinstance(drain_chunks, str):
-            p = Path(drain_chunks)
-            if p.exists():
-                out.append(p)
-            else:
-                log.warning(f"[Split] drain_chunks файл не найден: {p}")
-        else:
-            log.warning("[Split] dataset.drain_chunks не указан в config.yaml")
-    else:
-        # Для построения словаря используем vocab_list или dataset_list
-        # 1. dataset.vocab_list (приоритетный)
-        for key in ["vocab_list", "dataset_list"]:
-            lst = ds.get(key, [])
-            if isinstance(lst, list):
-                for item in lst:
-                    p = Path(item)
-                    if p.exists():
-                        out.append(p)
-                    else:
-                        log.warning(f"[Vocab] Config file not found: {p}")
-
-        # 2. Если списки пусты — dataset.prepared (директория)
-        if not out and isinstance(ds.get("prepared"), str):
-            p = Path(ds["prepared"])
-            if p.exists() and p.is_dir():
-                out.append(p)
-
-    return out
+# _inputs_from_config теперь импортируется из modules.paths
 
 
 def _vocab_dir_from_config(cfg: dict) -> Path | None:
@@ -506,7 +462,7 @@ def main(
     # Определяем входные файлы для split (используем dataset.drain_chunks)
     split_input_files = list(inputs) if inputs else []
     if not split_input_files and cfg:
-        cfg_split_inputs = _inputs_from_config(cfg, for_split=True)
+        cfg_split_inputs = get_input_files_from_config(cfg, for_split=True)
         if cfg_split_inputs:
             split_input_files.extend(cfg_split_inputs)
             log.info(f"[Split] Inputs from config (drain_chunks): {[str(p) for p in cfg_split_inputs]}")
@@ -535,7 +491,7 @@ def main(
     # Определяем входные файлы для vocab (используем vocab_list или те же что указаны в --inputs)
     vocab_input_files = list(inputs) if inputs else []
     if not vocab_input_files and cfg:
-        cfg_vocab_inputs = _inputs_from_config(cfg, for_split=False)
+        cfg_vocab_inputs = get_input_files_from_config(cfg, for_split=False)
         if cfg_vocab_inputs:
             vocab_input_files.extend(cfg_vocab_inputs)
             log.info(f"[Vocab] Inputs from config (vocab_list): {[str(p) for p in cfg_vocab_inputs]}")
@@ -560,14 +516,17 @@ def main(
 
     # Читаем параметры фильтрации из config.yaml
     min_support = 1
-    exclude_patterns: list[str] | None = None
     drain_templates_path: Path | None = None
 
     vocab_cfg = cfg.get("vocab", {})
     min_support = int(vocab_cfg.get("min_support", 1))
-    ep = vocab_cfg.get("exclude_patterns")
-    if isinstance(ep, list) and all(isinstance(x, str) for x in ep):
-        exclude_patterns = ep
+    
+    # exclude_patterns больше не используется - удалено из логики
+    if vocab_cfg.get("exclude_patterns"):
+        log.warning(
+            "[Vocab] exclude_patterns указан в config.yaml, но больше не используется. "
+            "Все события из drain_templates.json будут включены в словарь (с учетом min_support)."
+        )
     
     # Определяем путь к drain_templates.json из dataset.drain
     dataset_cfg = cfg.get("dataset", {})
@@ -585,7 +544,6 @@ def main(
     
     log.info(
         f"[Vocab] Config params: min_support={min_support}, "
-        f"exclude_patterns={len(exclude_patterns or [])}, "
         f"drain_templates={drain_templates_path}"
     )
     
@@ -594,7 +552,7 @@ def main(
         outdir=vocab_output_dir,
         drain_templates_path=drain_templates_path,
         min_support=min_support,
-        exclude_patterns=exclude_patterns,
+        exclude_patterns=None,  # Больше не используется
     )
     log.info(f"✅ Построение словаря завершено. Saved vocab={vocab_path}, stats={stats_path}")
     

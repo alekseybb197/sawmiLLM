@@ -87,9 +87,11 @@ from tqdm import tqdm
 
 from modules.model import UnifiedLogBERT
 from modules.datasets import WindowsDataset, load_prepared_tensors
-from modules.utils import ensure_dir, device_autoselect, recommend_action
+from modules.utils import ensure_dir, recommend_action
 from modules.logger import get_logger
 from modules.config import get_config, Config
+from modules.model_utils import get_device_from_config, get_checkpoint_dir_from_config
+from modules.paths import get_train_val_paths_from_config, get_vocab_path_from_config
 
 log = get_logger(__name__)
 
@@ -442,7 +444,7 @@ def train_one_epoch(
 
     # --- Load or init model ---
     # Выбираем устройство (CUDA, MPS или CPU) для определения pin_memory
-    dev = device_autoselect()
+    dev = get_device_from_config(config)
     device_ref = dev  # Сохраняем для использования в handle_interrupt
     log.info(f"🖥️  Используемое устройство: {dev}")
     # pin_memory работает только с CUDA, поэтому проверяем тип устройства
@@ -521,12 +523,11 @@ def train_one_epoch(
     # --- Start MLflow run (если включен) ---
     # Используем контекстный менеджер только если MLflow включен
     # Если MLflow отключен, используем пустой контекстный менеджер
-    mlflow_run_context: object
     if mlflow_enabled:
         mlflow_run_context = mlflow.start_run(run_name=f"epoch_{epoch}")
     else:
         # Создаем пустой контекстный менеджер для совместимости
-        mlflow_run_context = nullcontext()
+        mlflow_run_context = nullcontext()  # type: ignore[assignment]
     
     # Сохраняем ссылку на контекст MLflow для обработчика прерывания
     mlflow_run_context_obj = mlflow_run_context
@@ -946,30 +947,38 @@ def main(
         log.info(f"📊 Используется указанная эпоха: {epoch}")
     
     # Определяем пути из config.yaml, если не указаны явно
-    # train_pt: dataset.dataset/train.pt
-    if train_pt is None:
-        dataset_dir = Path(dataset_cfg.get("dataset", "./dataset/train"))
-        train_pt = dataset_dir / "train.pt"
-        if not train_pt.exists():
-            log.error(f"❌ Train file not found: {train_pt}")
-            log.error(f"   Please specify --train-pt or ensure train.pt exists in {dataset_dir}")
-            raise typer.Exit(code=1)
-        log.info(f"📁 Using train file from config: {train_pt}")
-    
-    # vocab: dataset.vocab/event_vocab.json
-    if vocab is None:
-        vocab_dir = Path(dataset_cfg.get("vocab", "./dataset/vocab"))
-        vocab = vocab_dir / "event_vocab.json"
-        if not vocab.exists():
-            log.error(f"❌ Vocab file not found: {vocab}")
-            log.error(f"   Please specify --vocab or ensure event_vocab.json exists in {vocab_dir}")
-            raise typer.Exit(code=1)
-        log.info(f"📁 Using vocab file from config: {vocab}")
+    # Используем функции из modules.paths и modules.model_utils
+    if train_pt is None or vocab is None or val_pt is None:
+        train_pt_cfg, val_pt_cfg, vocab_path_cfg = get_train_val_paths_from_config(config)
+        
+        if train_pt is None:
+            if train_pt_cfg:
+                train_pt = train_pt_cfg
+                log.info(f"📁 Using train file from config: {train_pt}")
+            else:
+                log.error("❌ Train file not found in config")
+                log.error("   Please specify --train-pt or ensure train.pt exists in dataset.dataset")
+                raise typer.Exit(code=1)
+        
+        if vocab is None:
+            if vocab_path_cfg:
+                vocab = vocab_path_cfg
+                log.info(f"📁 Using vocab file from config: {vocab}")
+            else:
+                log.error("❌ Vocab file not found in config")
+                log.error("   Please specify --vocab or ensure event_vocab.json exists in dataset.vocab")
+                raise typer.Exit(code=1)
+        
+        if val_pt is None:
+            if val_pt_cfg:
+                val_pt = val_pt_cfg
+                log.info(f"📁 Using validation file from config: {val_pt}")
+            else:
+                log.info(f"ℹ️  Validation file not found in config (will skip validation)")
     
     # ckpt_dir: model.checkpoints
     if ckpt_dir is None:
-        ckpt_dir_path = model_cfg.get("checkpoints", "./checkpoints")
-        ckpt_dir = Path(ckpt_dir_path)
+        ckpt_dir = get_checkpoint_dir_from_config(config)
         log.info(f"📁 Using checkpoints directory from config: {ckpt_dir}")
     
     # outdir: всегда используем model.reports из config.yaml (обязательно)
@@ -981,16 +990,6 @@ def main(
             raise typer.Exit(code=1)
         outdir = Path(reports_path)
         log.info(f"📁 Using output directory from config (model.reports): {outdir}")
-    
-    # val_pt: dataset.dataset/val.pt (опционально, если файл существует)
-    if val_pt is None:
-        dataset_dir = Path(dataset_cfg.get("dataset", "./dataset/train"))
-        val_pt_candidate = dataset_dir / "val.pt"
-        if val_pt_candidate.exists():
-            val_pt = val_pt_candidate
-            log.info(f"📁 Using validation file from config: {val_pt}")
-        else:
-            log.info(f"ℹ️  Validation file not found: {val_pt_candidate} (will skip validation)")
     
     # Формируем словарь переопределений из аргументов командной строки
     # (только те параметры, которые были явно указаны)

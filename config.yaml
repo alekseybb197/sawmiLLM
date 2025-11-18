@@ -211,6 +211,11 @@ dataset:
       pattern: '[0-9a-fA-F]{64}'
       replace: "<Sha256>"
       recovery: '\<Sha256\>'
+    
+    ## удаляем строки ошибок в tfs - они не используются в логах обучения, и также удаляются для инференса
+    tfs_error_line: ## строка ошибки в tfs
+      pattern: '^##\[error\].*$'
+      replace: ""
 
   encoding: "utf-8"
   batch_size: 256 # для RTX 4080 оптимально 256
@@ -233,10 +238,10 @@ dataset:
   random_seed: 42             # Seed для воспроизводимости
   
   windows: ## настройки окна для LogBERT, Для RTX 4080 оптимально
-    size: 64
-    d_model: 512
-    max_len: 512
-    batch_size: 256
+    size: 64                   # размер окна
+    d_model: 512               # размерность модели
+    max_len: 512               # максимальная длина последовательности
+    batch_size: 256            # размер батча
 
   # Настройки разметки секций, используется для разметки секций в drain_dataset.py
   section_markers:
@@ -260,11 +265,6 @@ dataset:
 
 vocab:
   min_support: 1 # минимальная частота события для включения в словарь
-  exclude_patterns:
-    - "<TFS_Section>"
-    - "##\\[debug\\]"
-    - "Environment"
-    - "Variable"
 
 # Настройки логгирования
 logging:
@@ -284,6 +284,7 @@ gpu:
 model:
   checkpoints: "./model/checkpoints"
   reports: "./dataset/reports"
+  percentile: 99.5 # порог для калибровки порога детектирования аномалий
   quantized: "./model/quantized"
   mlflow:
     url: "http://localhost:5000"
@@ -306,6 +307,10 @@ model:
   grad_clip: 1.0         # Gradient clipping threshold
   amp: true              # Использовать mixed precision training
   seed: 42               # Seed для воспроизводимости
+
+inference:
+  drain_dir: "./inference/drain"
+  scored_dir: "./inference/scored"
 
 # Настройки тестирования
 testing:

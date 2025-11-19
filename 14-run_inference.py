@@ -24,8 +24,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from drain3.template_miner import TemplateMiner  # type: ignore[import-untyped]
-from drain3.file_persistence import FilePersistence  # type: ignore[import-untyped]
+from drain3.template_miner import TemplateMiner
+from drain3.file_persistence import FilePersistence
 
 from modules.model import UnifiedLogBERT
 from modules.utils import ensure_dir
@@ -159,7 +159,9 @@ class EventVocab:
             return "[UNK]", self.unk_id
 
         # Используем cluster_id напрямую как event_id
-        event_id = str(cluster_id)
+        # ВАЖНО: во всём пайплайне события имеют вид "E123"
+        # поэтому и здесь нужно добавить префикс "E"
+        event_id = f"E{cluster_id}"
 
         # Получаем token_id для event_id
         token_id = self.event_to_id.get(event_id, self.unk_id)
@@ -371,54 +373,52 @@ def build_windows(
     sections: List[int],
     window_size: int,
     pad_id: int,
-) -> Tuple[List[List[int]], List[List[int]], List[List[int]], List[Optional[int]], List[Optional[int]]]:
+) -> Tuple[List[List[int]], List[int], List[int], List[int]]:
     """
-    Строит окна как при обучении: окно [i:i+window_size], target = events[i+window_size].
+    Строит окна как при обучении next-event моделирования:
     
-    events, sections длины L -> окна длиной window_size со слайдом 1.
-
+    Для последовательности длины L:
+    - для target_pos в [window_size, L-1]:
+        вход:  events[target_pos-window_size : target_pos]
+        target: events[target_pos]
+        sec_id: bucket секции target-события
+    
     Возвращает:
-      - all_input_ids:   List[window] (token_ids для окна)
-      - all_section_ids: List[window] (section_ids для окна)
-      - all_global_pos:  List[window] (номер элемента в исходной последовательности или -1 для паддинга)
-      - all_target_ids:  List[Optional[int]] (target token_id - следующее событие после окна, или None если нет)
-      - all_target_pos:  List[Optional[int]] (позиция target в исходной последовательности, или None)
+      - input_ids_list:  List[List[int]] (окна длиной window_size)
+      - sec_ids_list:    List[int] (один section_id на окно - секция target-события)
+      - target_ids_list: List[int] (target token_id для каждого окна)
+      - target_pos_list: List[int] (позиция target в исходной последовательности)
     """
     assert len(events) == len(sections)
     L = len(events)
-    if L == 0:
-        return [], [], [], [], []
+    if L <= window_size:
+        logger.warning(
+            "Последовательность длины %d <= window_size=%d, окна не построены",
+            L,
+            window_size,
+        )
+        return [], [], [], []
 
-    all_input_ids: List[List[int]] = []
-    all_section_ids: List[List[int]] = []
-    all_global_pos: List[List[int]] = []
-    all_target_ids: List[Optional[int]] = []
-    all_target_pos: List[Optional[int]] = []
+    input_ids_list: List[List[int]] = []
+    sec_ids_list: List[int] = []
+    target_ids_list: List[int] = []
+    target_pos_list: List[int] = []
 
-    for start in range(L):
-        end = min(start + window_size, L)
-        window_tokens = events[start:end]
-        window_sections = sections[start:end]
-        window_pos = list(range(start, end))
+    # Создаем окна только для валидных target позиций (как в prepare_windows)
+    for target_pos in range(window_size, L):
+        start = target_pos - window_size
+        window_tokens = events[start:target_pos]  # Окно ДО target, длина = window_size
+        
+        if len(window_tokens) != window_size:
+            # На всякий случай — не должно случаться
+            continue
 
-        # Target - следующее событие после окна (как при обучении)
-        # Если окно заканчивается в конце последовательности, target = None
-        target_pos = start + window_size
-        target_id = events[target_pos] if target_pos < L else None
+        input_ids_list.append(window_tokens)
+        sec_ids_list.append(sections[target_pos])  # Секция target-события
+        target_ids_list.append(events[target_pos])
+        target_pos_list.append(target_pos)
 
-        pad_len = window_size - (end - start)
-        if pad_len > 0:
-            window_tokens = window_tokens + [pad_id] * pad_len
-            window_sections = window_sections + [0] * pad_len
-            window_pos = window_pos + [-1] * pad_len
-
-        all_input_ids.append(window_tokens)
-        all_section_ids.append(window_sections)
-        all_global_pos.append(window_pos)
-        all_target_ids.append(target_id)
-        all_target_pos.append(target_pos if target_pos < L else None)
-
-    return all_input_ids, all_section_ids, all_global_pos, all_target_ids, all_target_pos
+    return input_ids_list, sec_ids_list, target_ids_list, target_pos_list
 
 
 # ---------------------------
@@ -428,34 +428,33 @@ def build_windows(
 def infer_nll_per_position(
     model: torch.nn.Module,
     input_ids_list: List[List[int]],
-    section_ids_list: List[List[int]],
-    target_ids_list: List[Optional[int]],
-    target_pos_list: List[Optional[int]],
+    sec_ids_list: List[int],
+    target_ids_list: List[int],
+    target_pos_list: List[int],
+    num_events: int,
     pad_id: int,
     batch_size: int,
 ) -> List[Optional[float]]:
     """
-    Прогоняем все окна через модель, считаем NLL для каждого target-события.
+    Прогоняет все окна через модель, считает NLL для каждого target_pos.
+    Если для одной позиции несколько окон → усредняем NLL.
     
-    Логика как при обучении:
-    - Окно: события [i, i+window_size)
-    - Target: событие на позиции i+window_size (следующее после окна)
-    - NLL вычисляется для target-события
-    
-    Если позиция попадает в несколько окон как target — усредняем NLL по всем попаданиям.
+    ВАЖНО: Логика должна совпадать с калибровкой (13-calibrate_threshold.py):
+    - Используем nn.CrossEntropyLoss(reduction="none") для вычисления NLL
+    - NLL вычисляется для каждого окна отдельно (как в калибровке)
+    - Если позиция попадает в несколько окон как target — усредняем NLL
     """
-    device = next(model.parameters()).device
     if not input_ids_list:
-        return []
+        return [None] * num_events
 
-    # Находим максимальную позицию target для определения размера массива
-    max_target_pos = max((p for p in target_pos_list if p is not None), default=-1)
-    if max_target_pos < 0:
-        return []
+    device = next(model.parameters()).device
 
-    num_tokens = max_target_pos + 1
-    sums = [0.0 for _ in range(num_tokens)]
-    counts = [0 for _ in range(num_tokens)]
+    # Инициализируем массивы для всех событий (длина = num_events)
+    sums = [0.0 for _ in range(num_events)]
+    counts = [0 for _ in range(num_events)]
+
+    # Используем CrossEntropyLoss как в калибровке
+    ce = torch.nn.CrossEntropyLoss(reduction="none")
 
     def chunks(lst, n):
         for i in range(0, len(lst), n):
@@ -468,40 +467,26 @@ def infer_nll_per_position(
         total=total_batches,
         desc="Inference",
     ):
-        batch_section_ids = section_ids_list[start_idx:start_idx + len(batch_input_ids)]
+        batch_sec_ids = sec_ids_list[start_idx:start_idx + len(batch_input_ids)]
         batch_target_ids = target_ids_list[start_idx:start_idx + len(batch_input_ids)]
         batch_target_pos = target_pos_list[start_idx:start_idx + len(batch_input_ids)]
 
-        input_ids = torch.tensor(batch_input_ids, dtype=torch.long, device=device)
-        section_ids_full = torch.tensor(batch_section_ids, dtype=torch.long, device=device)
-        
-        # Модель ожидает sec_ids формы (B,), а не (B, L)
-        # Берем первый section_id из каждого окна (все позиции в окне должны быть из одной секции)
-        sec_ids = section_ids_full[:, 0]  # (batch_size,)
+        input_ids = torch.tensor(batch_input_ids, dtype=torch.long, device=device)  # (B, S)
+        sec_ids = torch.tensor(batch_sec_ids, dtype=torch.long, device=device)  # (B,)
+        target_ids_tensor = torch.tensor(batch_target_ids, dtype=torch.long, device=device)  # (B,)
 
         with torch.no_grad():
-            # Модель UnifiedLogBERT принимает input_ids (B, L) и sec_ids (B,)
-            # Возвращает logits [B, V] для предсказания следующего события после окна
-            logits = model(input_ids, sec_ids)  # (batch_size, vocab_size)
-            
-            # Вычисляем log probabilities для всех токенов в словаре
-            log_probs = F.log_softmax(logits, dim=-1)  # (batch_size, vocab_size)
+            logits = model(input_ids, sec_ids)  # (B, V)
+            # Вычисляем NLL для каждого окна (как в калибровке)
+            loss = ce(logits, target_ids_tensor)  # (B,)
 
-        # Для каждого окна вычисляем NLL для target-события (следующее после окна)
-        batch_size_cur = input_ids.shape[0]
-        for b in range(batch_size_cur):
-            target_id = batch_target_ids[b]
-            target_pos = batch_target_pos[b]
-            
-            # Пропускаем окна без target (окна в конце последовательности)
-            if target_id is None or target_pos is None:
-                    continue
-            
-            # NLL для предсказания target-события
-            nll = -log_probs[b, target_id].item()
-            sums[target_pos] += nll
-            counts[target_pos] += 1
+        # Для каждого окна сохраняем NLL для его target-позиции
+        for b, global_pos in enumerate(batch_target_pos):
+            nll = loss[b].item()
+            sums[global_pos] += nll
+            counts[global_pos] += 1
 
+    # Усредняем NLL для позиций, которые были target в нескольких окнах
     nll_per_pos: List[Optional[float]] = []
     for s, c in zip(sums, counts):
         if c == 0:
@@ -633,19 +618,21 @@ def process_single_file(
     logger.info("💾 Сохранено %d чанков в drain_chunks.jsonl", len(chunks_records))
 
     # Инференс через модель
-    input_ids_list, section_ids_list, global_pos_list, target_ids_list, target_pos_list = build_windows(
+    input_ids_list, sec_ids_list, target_ids_list, target_pos_list = build_windows(
         events=events,
         sections=sections,
         window_size=window_size,
         pad_id=vocab.pad_id,
     )
 
+    num_events = len(events)
     nll_per_pos = infer_nll_per_position(
         model=model,
         input_ids_list=input_ids_list,
-        section_ids_list=section_ids_list,
+        sec_ids_list=sec_ids_list,
         target_ids_list=target_ids_list,
         target_pos_list=target_pos_list,
+        num_events=num_events,
         pad_id=vocab.pad_id,
         batch_size=batch_size,
     )

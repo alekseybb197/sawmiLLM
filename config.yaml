@@ -284,7 +284,7 @@ gpu:
 model:
   checkpoints: "./model/checkpoints"
   reports: "./dataset/reports"
-  percentile: 99.5 # порог для калибровки порога детектирования аномалий
+  percentile: 99.999 # порог для калибровки порога детектирования аномалий
   quantized: "./model/quantized"
   mlflow:
     url: "http://localhost:5000"

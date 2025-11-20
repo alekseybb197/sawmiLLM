@@ -283,9 +283,10 @@ gpu:
 # Настройки модели LogBERT для обучения
 model:
   checkpoints: "./model/checkpoints"
-  reports: "./dataset/reports"
+  reports: "./model/reports"
   percentile: 99.999 # порог для калибровки порога детектирования аномалий
   quantized: "./model/quantized"
+  onnx: "./model/onnx"
   mlflow:
     url: "http://localhost:5000"
     experiment_name: "LogBERT_training"

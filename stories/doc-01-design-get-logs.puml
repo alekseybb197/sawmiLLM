@@ -1,0 +1,111 @@
+@startuml Azure DevOps Log Retrieval Pipeline
+
+' === Стили ===
+skinparam defaultFontSize 10
+skinparam defaultFontName Arial
+skinparam rectangle {
+  BorderColor Black
+  BackgroundColor LightCyan
+}
+
+' ========================
+' 0. AZURE DEVOPS API
+' ========================
+rectangle "Azure DevOps REST API\n(https://tfs.org.dom/tfs)" as api
+
+note right of api
+  Доступ через:\n
+  • PAT Token\n
+  • Account, Organization, Project\n
+  • API URL: /_apis/pipelines, /builds, /logs\n
+  → Requires authentication
+end note
+
+' ========================
+' 1. ENVIRONMENT VARIABLES (OBOSOBNY BLOK)
+' ========================
+rectangle ".env\nTFS_PAT_TOKEN='...'\nTFS_ACCOUNT='Username'\nTFS_ORGANIZATION='Organization'\nTFS_PROJECT='Project'\nTFS_API_URL='https://tfs.org.dom/tfs'" as env
+
+' ========================
+' 2. PYTHON SCRIPTS
+' ========================
+rectangle "get-pipelines.py" as get_pipelines
+rectangle "get-builds.py pipeline_id5" as get_builds
+rectangle "get-logs.py pipeline_id5 buid_id1" as get_logs
+
+' === ОДНА СТРЕЛКА ОТ .env КО ВСЕМ СКРИПТАМ ===
+env --> get_pipelines : load config
+env --> get_builds : load config
+env --> get_logs : load config
+
+' ========================
+' 3. DATA FLOW
+' ========================
+rectangle "pipelines.csv\nID,Name,Folder\npipeline_id1,Pipeline Name1,\\path-to-repo\\app1\n..." as pipelines_csv
+
+get_pipelines --> pipelines_csv : fetch pipelines
+
+rectangle "pipeline_id-successed-builds.csv\nRun ID,Name,State,Result,Created Date,Finished Date,Pipeline Name\nbuid_id1,version1,completed,succeeded,2025-10-27T12:37:23.5208593Z,2025-10-27T13:08:02.8185187Z,Pipeline Name5\n..." as builds_csv
+
+pipelines_csv --> get_builds : pipeline_id
+get_builds --> builds_csv : fetch builds
+
+rectangle "pipeline_id-build_id-logs.csv\nID,Lines,Created,URL,Last Changed\n2,23,2020-11-12T06:14:33.747Z,https://tfs.org.dom/tfs/.../logs/2,2020-11-12T06:14:33.747Z\n..." as logs_csv
+
+builds_csv --> get_logs : pipeline_id, build_id
+get_logs --> logs_csv : fetch log metadata
+
+rectangle "pipeline_id-build_id-logs_content.txt\n2020-11-12T06:14:33.7066124Z ##[section]Starting: Prepare job Job_1\n2020-11-12T06:14:33.7222246Z ContinueOnError: False\n2020-11-12T06:14:33.7222246Z TimeoutInMinutes: 180\n..." as logs_content
+
+get_logs --> logs_content : download raw logs
+
+' === Arrows with Colors ===
+api -[#Blue]-> get_pipelines : API access
+
+get_pipelines -[#DarkGreen]-> pipelines_csv : pipelines
+pipelines_csv -[#Purple]-> get_builds : pipeline_id
+get_builds -[#Teal]-> builds_csv : builds
+builds_csv -[#Orange]-> get_logs : pipeline_id, build_id
+get_logs -[#Red]-> logs_csv : log metadata
+get_logs -[#Red]-> logs_content : raw logs
+
+' === NOTES ===
+note right of env
+  Environment variables:\n
+  • Centralized config\n
+  • Loaded by all scripts\n
+  → One source of truth
+end note
+
+note right of get_pipelines
+  Fetch all pipelines:\n
+  • GET /_apis/pipelines\n
+  • Output: pipelines.csv\n
+  • Used to iterate over pipelines
+end note
+
+note right of get_builds
+  Fetch builds for pipeline:\n
+  • GET /_apis/pipelines/{id}/runs\n
+  • Filter: only succeeded builds\n
+  • Output: builds.csv per pipeline
+end note
+
+note right of get_logs
+  Fetch logs for build:\n
+  • GET /_apis/pipelines/{id}/runs/{buildId}/logs\n
+  • Download each log file\n
+  • Combine into logs_content.txt
+end note
+
+note right of logs_content
+  Raw log content:\n
+  • With timestamps\n
+  • With ##[section], ##[error]\n
+  • Ready for cleaning → next step
+end note
+
+caption Azure DevOps Log Retrieval Pipeline\n.env → Python Scripts → Pipelines → Builds → Logs → Raw Content
+footer Created: November 10, 2025 | Data collection flow for UnifiedLogBERT
+
+@enduml
